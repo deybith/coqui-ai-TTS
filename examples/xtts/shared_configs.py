@@ -114,10 +114,10 @@ class BaseAudioConfig(Coqpit):
             Path to the computed stats file. Defaults to None.
     """
 
-    # stft parameters
-    fft_size: int = 1024
-    win_length: int = 1024
-    hop_length: int = 256
+    # stft parameters - Improved for better audio quality
+    fft_size: int = 2048        # Increased from 1024 for better frequency resolution
+    win_length: int = 2048      # Match fft_size
+    hop_length: int = 512       # Adjusted proportionally
     frame_shift_ms: int = None
     frame_length_ms: int = None
     stft_pad_mode: str = "reflect"
@@ -126,21 +126,21 @@ class BaseAudioConfig(Coqpit):
     resample: bool = False
     preemphasis: float = 0.0
     ref_level_db: int = 20
-    do_sound_norm: bool = False
+    do_sound_norm: bool = True  # Enable for better consistency
     log_func: str = "np.log10"
-    # silence trimming
+    # silence trimming - Less aggressive to prevent word cutting
     do_trim_silence: bool = True
-    trim_db: int = 45
-    # rms volume normalization
-    do_rms_norm: bool = False
-    db_level: float = None
-    # griffin-lim params
-    power: float = 1.5
-    griffin_lim_iters: int = 60
-    # mel-spec params
-    num_mels: int = 80
-    mel_fmin: float = 0.0
-    mel_fmax: float = None
+    trim_db: int = 30           # Reduced from 45 for less aggressive trimming
+    # rms volume normalization - Enable for consistent levels
+    do_rms_norm: bool = True    # Enable RMS normalization
+    db_level: float = -25.0     # Set appropriate level
+    # griffin-lim params - Improved for better synthesis
+    power: float = 2.0          # Increased from 1.5 for better reconstruction
+    griffin_lim_iters: int = 100 # Increased from 60 for better quality
+    # mel-spec params - Enhanced resolution
+    num_mels: int = 100         # Increased from 80 for better resolution
+    mel_fmin: float = 50.0      # Better for most voices (was 0.0)
+    mel_fmax: float = 8000.0    # Set appropriate upper frequency (was None)
     spec_gain: int = 20
     do_amp_to_db_linear: bool = True
     do_amp_to_db_mel: bool = True
@@ -149,7 +149,7 @@ class BaseAudioConfig(Coqpit):
     pitch_fmin: float = 1.0
     # normalization params
     signal_norm: bool = True
-    min_level_db: int = -100
+    min_level_db: int = -120    # Better dynamic range (was -100)
     symmetric_norm: bool = True
     max_norm: float = 4.0
     clip_norm: bool = True

@@ -599,6 +599,12 @@ class Trainer(Base, DataLoading, FitFunctions, Testing, EvalFunctions, StaticMet
         
         # Format and validate batch data
         batch = self.format_batch(batch)
+        
+        # Enhanced TTS-specific batch validation
+        if not self._validate_tts_batch_quality(batch):
+            logger.debug(" [!] Skipping batch due to TTS quality issues")
+            return None, None
+            
         loader_time = time.time() - loader_start_time
 
         outputs: dict[str, Any] | list[dict[str, Any]]
@@ -681,6 +687,11 @@ class Trainer(Base, DataLoading, FitFunctions, Testing, EvalFunctions, StaticMet
 
                 if step_optimizer:
                     self.model.zero_grad(set_to_none=True)
+
+        # Enhanced TTS loss pattern monitoring
+        if loss_dict and not self._monitor_tts_loss_patterns(loss_dict, step):
+            logger.warning(f" [!] Step {step}: Problematic loss patterns detected")
+            # Don't skip but flag for monitoring
 
         # Enhanced metrics tracking
         if self.keep_avg_train is not None:
@@ -805,4 +816,171 @@ class Trainer(Base, DataLoading, FitFunctions, Testing, EvalFunctions, StaticMet
             if self.config.model_param_stats:
                 self.dashboard_logger.model_weights(self.model, self.total_steps_done)
         torch.cuda.empty_cache()
+
+    def _validate_audio_quality_outputs(self, outputs: dict[str, Any], step: int) -> bool:
+        """Validate outputs for TTS-specific audio quality issues.
+        
+        Checks for early signs of:
+        1. Audio cut-off (missing words) - inconsistent sequence lengths
+        2. Wrong language pronunciation - unexpected character patterns  
+        3. Robotic/interference sounds - abnormal spectral values
+        
+        Args:
+            outputs: Model outputs dictionary
+            step: Current training step
+            
+        Returns:
+            bool: True if outputs are valid, False if quality issues detected
+        """
+        if not isinstance(outputs, dict):
+            return True
+            
+        # Check for sequence length consistency (audio cut-off prevention)
+        if "decoder_outputs" in outputs:
+            decoder_out = outputs["decoder_outputs"]
+            if isinstance(decoder_out, torch.Tensor):
+                # Check for abnormally short sequences that might indicate cut-off
+                seq_lens = decoder_out.shape[-1] if len(decoder_out.shape) > 2 else decoder_out.shape[0]
+                if seq_lens < 10:  # Very short sequences are suspicious
+                    logger.warning(f" [!] Step {step}: Very short decoder output detected (length: {seq_lens})")
+                    return False
+                    
+        # Check for mel-spectrogram quality (robotic sound prevention)
+        if "mel_outputs" in outputs or "linear_outputs" in outputs:
+            mel_key = "mel_outputs" if "mel_outputs" in outputs else "linear_outputs"
+            mel_out = outputs[mel_key]
+            if isinstance(mel_out, torch.Tensor):
+                # Check for abnormal spectral values
+                if torch.any(mel_out > 5.0) or torch.any(mel_out < -10.0):
+                    logger.warning(f" [!] Step {step}: Abnormal mel-spectrogram values detected")
+                    return False
+                # Check for NaN/Inf in spectrograms
+                if torch.isnan(mel_out).any() or torch.isinf(mel_out).any():
+                    logger.warning(f" [!] Step {step}: NaN/Inf in mel-spectrogram outputs")
+                    return False
+                    
+        # Check for attention alignment quality (language pronunciation)
+        if "alignments" in outputs or "attention_weights" in outputs:
+            attn_key = "alignments" if "alignments" in outputs else "attention_weights"
+            attn = outputs[attn_key]
+            if isinstance(attn, torch.Tensor) and len(attn.shape) >= 2:
+                # Check for proper attention focus (not scattered)
+                attn_max = torch.max(attn, dim=-1)[0]
+                if torch.mean(attn_max) < 0.1:  # Very weak attention is suspicious
+                    logger.warning(f" [!] Step {step}: Weak attention alignment detected")
+                    return False
+                    
+        return True
+
+    def _monitor_tts_loss_patterns(self, loss_dict: dict[str, Any], step: int) -> bool:
+        """Monitor loss patterns for TTS-specific quality degradation.
+        
+        Detects patterns that lead to:
+        1. Audio cut-off - sudden spikes in reconstruction loss
+        2. Language mixing - inconsistent phoneme/character losses  
+        3. Robotic sounds - mel-spectrogram loss instability
+        
+        Args:
+            loss_dict: Dictionary containing various loss components
+            step: Current training step
+            
+        Returns:
+            bool: True if loss patterns are healthy, False if problematic
+        """
+        # Check for reconstruction loss spikes (audio cut-off indicator)
+        if "reconstruction_loss" in loss_dict or "mel_loss" in loss_dict:
+            recon_key = "reconstruction_loss" if "reconstruction_loss" in loss_dict else "mel_loss"
+            recon_loss = loss_dict[recon_key]
+            if isinstance(recon_loss, torch.Tensor):
+                recon_val = recon_loss.item()
+                # Very high reconstruction loss indicates potential cut-off
+                if recon_val > 10.0:
+                    logger.warning(f" [!] Step {step}: High reconstruction loss ({recon_val:.3f}) - potential audio cut-off")
+                    return False
+                    
+        # Check for attention loss instability (language mixing indicator) 
+        if "attention_loss" in loss_dict or "alignment_loss" in loss_dict:
+            attn_key = "attention_loss" if "attention_loss" in loss_dict else "alignment_loss"
+            attn_loss = loss_dict[attn_key]
+            if isinstance(attn_loss, torch.Tensor):
+                attn_val = attn_loss.item()
+                # High attention loss suggests poor text-audio alignment
+                if attn_val > 5.0:
+                    logger.warning(f" [!] Step {step}: High attention loss ({attn_val:.3f}) - potential language mixing")
+                    return False
+                    
+        # Check for spectral loss patterns (robotic sound indicator)
+        if "spectral_loss" in loss_dict or "postnet_loss" in loss_dict:
+            spec_key = "spectral_loss" if "spectral_loss" in loss_dict else "postnet_loss"
+            spec_loss = loss_dict[spec_key]
+            if isinstance(spec_loss, torch.Tensor):
+                spec_val = spec_loss.item()
+                # Unstable spectral loss can cause robotic artifacts
+                if spec_val > 8.0:
+                    logger.warning(f" [!] Step {step}: High spectral loss ({spec_val:.3f}) - potential robotic artifacts")
+                    return False
+                    
+        return True
+
+    def _validate_tts_batch_quality(self, batch: dict[str, Any]) -> bool:
+        """Validate batch data for TTS-specific quality issues.
+        
+        Checks for data that could lead to:
+        1. Audio cut-off - text/audio length mismatches
+        2. Language mixing - mixed character encodings
+        3. Training instability - abnormal input distributions
+        
+        Args:
+            batch: Input batch dictionary
+            
+        Returns:
+            bool: True if batch is valid, False if should be skipped
+        """
+        if not isinstance(batch, dict):
+            return True
+            
+        # Check text and audio length consistency (cut-off prevention)
+        if "text" in batch and "mel" in batch:
+            text_tensor = batch["text"]
+            mel_tensor = batch["mel"]
+            
+            if isinstance(text_tensor, torch.Tensor) and isinstance(mel_tensor, torch.Tensor):
+                # Check for reasonable text-to-mel ratios
+                text_len = text_tensor.shape[-1] if len(text_tensor.shape) > 1 else text_tensor.shape[0]
+                mel_len = mel_tensor.shape[-1] if len(mel_tensor.shape) > 2 else mel_tensor.shape[1]
+                
+                # Typical TTS ratio is ~5-15 mel frames per character
+                if mel_len > 0 and text_len > 0:
+                    ratio = mel_len / text_len
+                    if ratio < 2.0 or ratio > 50.0:  # Suspicious ratios
+                        logger.debug(f" [!] Suspicious text-mel ratio: {ratio:.2f} (text: {text_len}, mel: {mel_len})")
+                        return False
+                        
+        # Check for text encoding consistency (language mixing prevention)
+        if "text" in batch or "token_ids" in batch:
+            text_key = "text" if "text" in batch else "token_ids"
+            text_data = batch[text_key]
+            
+            if isinstance(text_data, torch.Tensor):
+                # Check for abnormal token ranges that might indicate mixed languages
+                if text_data.max() > 1000:  # Very high token IDs are suspicious
+                    logger.debug(" [!] Very high token IDs detected - possible encoding issues")
+                    return False
+                # Check for negative values
+                if text_data.min() < 0:
+                    logger.debug(" [!] Negative token IDs detected")
+                    return False
+                    
+        # Check for audio quality indicators
+        if "mel" in batch or "linear" in batch:
+            audio_key = "mel" if "mel" in batch else "linear"
+            audio_data = batch[audio_key]
+            
+            if isinstance(audio_data, torch.Tensor):
+                # Check for abnormal spectral values
+                if torch.any(audio_data > 10.0) or torch.any(audio_data < -15.0):
+                    logger.debug(" [!] Abnormal spectral values in batch")
+                    return False
+                    
+        return True
 

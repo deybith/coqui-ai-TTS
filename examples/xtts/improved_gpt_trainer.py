@@ -1,0 +1,227 @@
+"""
+Improved training configuration for better TTS quality.
+This addresses issues with audio cutting off, wrong language pronunciation, and robotic sounds.
+"""
+
+import gc
+import os
+
+from trainer import Trainer, TrainerArgs
+
+from xtts.shared_configs import BaseDatasetConfig
+from xtts.improved_audio_config import ImprovedAudioConfig
+from TTS.tts.datasets import load_tts_samples
+from TTS.tts.layers.xtts.trainer.gpt_trainer import GPTArgs, GPTTrainer, GPTTrainerConfig
+from TTS.tts.models.xtts import XttsAudioConfig
+from TTS.utils.manage import ModelManager
+
+
+def train_gpt_improved(language, num_epochs, batch_size, grad_acumm, train_csv, eval_csv, output_path, max_audio_length=440000, training_seed=54321):
+    """
+    Improved GPT training function with better audio quality settings.
+    
+    Args:
+        language: Target language for training
+        num_epochs: Number of training epochs
+        batch_size: Training batch size
+        grad_acumm: Gradient accumulation steps
+        train_csv: Path to training CSV file
+        eval_csv: Path to evaluation CSV file
+        output_path: Output directory for training results
+        max_audio_length: Maximum audio length in samples (increased from default)
+        training_seed: Random seed for reproducibility
+    """
+    
+    # Logging parameters
+    RUN_NAME = "GPT_XTTS_IMPROVED_FT"
+    PROJECT_NAME = "XTTS_trainer_improved"
+    DASHBOARD_LOGGER = "tensorboard"
+    LOGGER_URI = None
+
+    # Set here the path that the checkpoints will be saved
+    OUT_PATH = os.path.join(output_path, "run", "training")
+
+    # Training Parameters - Improved
+    OPTIMIZER_WD_ONLY_ON_WEIGHTS = True  # Changed to True for better training stability
+    START_WITH_EVAL = True  # Start with evaluation to check initial quality
+    BATCH_SIZE = batch_size
+    GRAD_ACUMM_STEPS = grad_acumm
+
+    # Define here the dataset that you want to use for the fine-tuning on.
+    config_dataset = BaseDatasetConfig(
+        formatter="coqui",
+        dataset_name="ft_dataset_improved",
+        path=os.path.dirname(train_csv),
+        meta_file_train=train_csv,
+        meta_file_val=eval_csv,
+        language=language,
+    )
+
+    # Add here the configs of the datasets
+    DATASETS_CONFIG_LIST = [config_dataset]
+
+    # Define the path where XTTS v2.0.1 files will be downloaded
+    CHECKPOINTS_OUT_PATH = os.path.join(OUT_PATH, "XTTS_v2.0_original_model_files/")
+    os.makedirs(CHECKPOINTS_OUT_PATH, exist_ok=True)
+
+    # DVAE files
+    DVAE_CHECKPOINT_LINK = "https://huggingface.co/coqui/XTTS-v2/resolve/main/dvae.pth"
+    MEL_NORM_LINK = "https://huggingface.co/coqui/XTTS-v2/resolve/main/mel_stats.pth"
+
+    # Set the path to the downloaded files
+    DVAE_CHECKPOINT = os.path.join(CHECKPOINTS_OUT_PATH, os.path.basename(DVAE_CHECKPOINT_LINK))
+    MEL_NORM_FILE = os.path.join(CHECKPOINTS_OUT_PATH, os.path.basename(MEL_NORM_LINK))
+
+    # download DVAE files if needed
+    if not os.path.isfile(DVAE_CHECKPOINT) or not os.path.isfile(MEL_NORM_FILE):
+        print(" > Downloading DVAE files!")
+        ModelManager._download_model_files(
+            [MEL_NORM_LINK, DVAE_CHECKPOINT_LINK], CHECKPOINTS_OUT_PATH, progress_bar=True
+        )
+
+    # Download XTTS v2.0 checkpoint if needed
+    TOKENIZER_FILE_LINK = "https://huggingface.co/coqui/XTTS-v2/resolve/main/vocab.json"
+    XTTS_CHECKPOINT_LINK = "https://huggingface.co/coqui/XTTS-v2/resolve/main/model.pth"
+    XTTS_CONFIG_LINK = "https://huggingface.co/coqui/XTTS-v2/resolve/main/config.json"
+
+    # XTTS transfer learning parameters
+    TOKENIZER_FILE = os.path.join(CHECKPOINTS_OUT_PATH, os.path.basename(TOKENIZER_FILE_LINK))
+    XTTS_CHECKPOINT = os.path.join(CHECKPOINTS_OUT_PATH, os.path.basename(XTTS_CHECKPOINT_LINK))
+    XTTS_CONFIG_FILE = os.path.join(CHECKPOINTS_OUT_PATH, os.path.basename(XTTS_CONFIG_LINK))
+
+    # download XTTS v2.0 files if needed
+    if not os.path.isfile(TOKENIZER_FILE) or not os.path.isfile(XTTS_CHECKPOINT):
+        print(" > Downloading XTTS v2.0 files!")
+        ModelManager._download_model_files(
+            [TOKENIZER_FILE_LINK, XTTS_CHECKPOINT_LINK, XTTS_CONFIG_LINK], CHECKPOINTS_OUT_PATH, progress_bar=True
+        )
+
+    # Improved model arguments
+    model_args = GPTArgs(
+        max_conditioning_length=220000,  # Increased from 132300 (10 secs instead of 6)
+        min_conditioning_length=66150,   # Keep minimum conditioning
+        debug_loading_failures=True,     # Enable debugging for loading failures
+        max_wav_length=max_audio_length, # Use the increased max length
+        max_text_length=300,             # Increased from 200 to handle longer texts
+        mel_norm_file=MEL_NORM_FILE,
+        dvae_checkpoint=DVAE_CHECKPOINT,
+        xtts_checkpoint=XTTS_CHECKPOINT,
+        tokenizer_file=TOKENIZER_FILE,
+        gpt_num_audio_tokens=1026,
+        gpt_start_audio_token=1024,
+        gpt_stop_audio_token=1025,
+        gpt_use_masking_gt_prompt_approach=True,
+        gpt_use_perceiver_resampler=True,
+    )
+    
+    # Improved audio config using our custom configuration
+    audio_config = XttsAudioConfig(
+        sample_rate=22050, 
+        dvae_sample_rate=22050, 
+        output_sample_rate=24000
+    )
+    
+    # Training parameters config - Improved
+    config = GPTTrainerConfig(
+        epochs=num_epochs,
+        output_path=OUT_PATH,
+        model_args=model_args,
+        run_name=RUN_NAME,
+        project_name=PROJECT_NAME,
+        run_description="Improved GPT XTTS training for better audio quality",
+        dashboard_logger=DASHBOARD_LOGGER,
+        logger_uri=LOGGER_URI,
+        audio=audio_config,
+        
+        # Training settings - Improved
+        batch_size=BATCH_SIZE,
+        eval_batch_size=max(BATCH_SIZE // 2, 1),  # Smaller eval batch for better memory usage
+        num_loader_workers=4,  # Reduced from 8 to avoid potential data loading issues
+        training_seed=training_seed,
+        
+        # Eval settings - Improved
+        eval_split_max_size=512,  # Increased for better evaluation
+        print_eval=True,  # Enable evaluation printing
+        
+        # Logging - More frequent for better monitoring
+        print_step=25,    # More frequent printing
+        plot_step=50,     # More frequent plotting
+        save_step=500,    # More frequent saving
+        
+        # Optimizer settings - Improved
+        optimizer="AdamW",
+        optimizer_wd_only_on_weights=OPTIMIZER_WD_ONLY_ON_WEIGHTS,
+        optimizer_params={
+            "betas": [0.9, 0.999],   # Changed from [0.9, 0.96] for better stability
+            "eps": 1e-8, 
+            "weight_decay": 5e-3     # Reduced weight decay from 1e-2
+        },
+        lr=3e-06,  # Reduced learning rate from 5e-06 for more stable training
+        lr_scheduler="CosineAnnealingLR",  # Changed from MultiStepLR for smoother decay
+        lr_scheduler_params={"T_max": num_epochs * 1000, "eta_min": 1e-7},  # Cosine annealing parameters
+        
+        # Additional training stability improvements
+        grad_clip=1.0,  # Add gradient clipping
+        mixed_precision=True,  # Enable mixed precision if not already enabled
+        
+        test_sentences=[]
+    )
+
+    # init the model from config
+    model = GPTTrainer.init_from_config(config)
+
+    # load training samples
+    train_samples, eval_samples = load_tts_samples(
+        DATASETS_CONFIG_LIST,
+        eval_split=True,
+        eval_split_max_size=config.eval_split_max_size,
+        eval_split_size=config.eval_split_size,
+    )
+
+    # Filter out samples that are too long or too short to avoid cutting issues
+    print(f"Original training samples: {len(train_samples)}")
+    train_samples_filtered = []
+    for sample in train_samples:
+        # Check text length (in words)
+        text_len = len(sample["text"].split())
+        if 5 <= text_len <= 50:  # Keep texts between 5 and 50 words
+            train_samples_filtered.append(sample)
+    
+    eval_samples_filtered = []
+    for sample in eval_samples:
+        # Check text length (in words)
+        text_len = len(sample["text"].split())
+        if 5 <= text_len <= 50:  # Keep texts between 5 and 50 words
+            eval_samples_filtered.append(sample)
+    
+    print(f"Filtered training samples: {len(train_samples_filtered)}")
+    print(f"Filtered eval samples: {len(eval_samples_filtered)}")
+
+    # init the trainer and 🚀
+    trainer = Trainer(
+        TrainerArgs(
+            restore_path=None,
+            skip_train_epoch=False,
+            start_with_eval=START_WITH_EVAL,
+            grad_accum_steps=GRAD_ACUMM_STEPS,
+        ),
+        config,
+        output_path=OUT_PATH,
+        model=model,
+        train_samples=train_samples_filtered,  # Use filtered samples
+        eval_samples=eval_samples_filtered,    # Use filtered samples
+    )
+    trainer.fit()
+
+    # get the longest text audio file to use as speaker reference
+    samples_len = [len(item["text"].split(" ")) for item in train_samples_filtered]
+    longest_text_idx = samples_len.index(max(samples_len))
+    speaker_ref = train_samples_filtered[longest_text_idx]["audio_file"]
+
+    trainer_out_path = trainer.output_path
+
+    # deallocate VRAM and RAM
+    del model, trainer, train_samples, eval_samples, train_samples_filtered, eval_samples_filtered
+    gc.collect()
+
+    return XTTS_CONFIG_FILE, XTTS_CHECKPOINT, TOKENIZER_FILE, trainer_out_path, speaker_ref
