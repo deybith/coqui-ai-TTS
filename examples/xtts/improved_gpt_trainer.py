@@ -8,8 +8,8 @@ import os
 
 from trainer import Trainer, TrainerArgs
 
-from xtts.shared_configs import BaseDatasetConfig
-from xtts.improved_audio_config import ImprovedAudioConfig
+from .shared_configs import BaseDatasetConfig
+from .improved_audio_config import ImprovedAudioConfig
 from TTS.tts.datasets import load_tts_samples
 from TTS.tts.layers.xtts.trainer.gpt_trainer import GPTArgs, GPTTrainer, GPTTrainerConfig
 from TTS.tts.models.xtts import XttsAudioConfig

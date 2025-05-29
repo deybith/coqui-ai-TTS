@@ -4,7 +4,7 @@ import re
 
 from trainer import Trainer, TrainerArgs
 
-from xtts.shared_configs import BaseDatasetConfig
+from shared_configs import BaseDatasetConfig
 from TTS.tts.datasets import load_tts_samples
 from TTS.tts.layers.xtts.trainer.gpt_trainer import GPTArgs, GPTTrainer, GPTTrainerConfig
 from TTS.tts.models.xtts import XttsAudioConfig

@@ -7,7 +7,7 @@ This configuration addresses common issues like:
 """
 
 from dataclasses import dataclass
-from xtts.shared_configs import BaseAudioConfig
+from .shared_configs import BaseAudioConfig
 
 
 @dataclass
