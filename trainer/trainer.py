@@ -15,6 +15,7 @@ from torch.utils.data import DataLoader
 from trainer._types import Callback, LossDict, LRScheduler
 from trainer.callbacks import TrainerCallback
 from trainer.config import TrainerArgs, TrainerConfig
+from trainer.checkpoint_manager import CheckpointManager, CheckpointConfig
 from trainer.generic_utils import (
     KeepAverage,
     count_parameters,
@@ -32,6 +33,8 @@ from trainer.utils.distributed import (
     init_distributed,
     rank_zero_logger_info,
 )
+from trainer.swa_utils import SWAManager, SWAConfig
+from trainer.deepspeed_utils import DeepspeedManager, DeepspeedConfig, create_deepspeed_config, is_deepspeed_available
 
 from trainer.core.base import Base
 from trainer.core.data_loading import DataLoading
@@ -40,6 +43,23 @@ from trainer.core.testing import Testing
 from trainer.core.eval_functions import EvalFunctions
 from trainer.core.static_methods import StaticMethods
 from trainer.core.helper_functions import HelperFunctions
+
+# TPU support - import conditionally
+try:
+    from trainer.utils.tpu import (
+        is_tpu_available, 
+        setup_tpu_training_env, 
+        get_tpu_device,
+        mark_step,
+        wait_for_tpu,
+        all_reduce,
+        get_tpu_world_size,
+        save_model_on_tpu,
+        print_tpu_memory_info
+    )
+    TPU_AVAILABLE = True
+except ImportError:
+    TPU_AVAILABLE = False
 
 logger = logging.getLogger("trainer")
 
@@ -69,6 +89,9 @@ class Trainer(Base, DataLoading, FitFunctions, Testing, EvalFunctions, StaticMet
         training_assets: dict[str, Any] | None = None,
         parse_command_line_args: bool = True,
         callbacks: dict[str, Callback] | None = None,
+        checkpoint_manager: CheckpointManager | None = None,
+        swa_config: SWAConfig | None = None,
+        deepspeed_config = None,  # DeepspeedConfig | None
         gpu: int | None = None,
     ) -> None:
         """Simple yet powerful 🐸💬 TTS trainer for PyTorch.
@@ -208,6 +231,22 @@ class Trainer(Base, DataLoading, FitFunctions, Testing, EvalFunctions, StaticMet
         self.dashboard_logger, self.c_logger = self.init_loggers(self.config, output_path, dashboard_logger, c_logger)
         # self.c_logger.logger = logger
 
+        # setup checkpoint manager
+        if checkpoint_manager is not None:
+            self.checkpoint_manager = checkpoint_manager
+        else:
+            # Create default checkpoint manager if not provided
+            checkpoint_config = CheckpointConfig(
+                keep_n_checkpoints=self.config.save_n_checkpoints,
+                save_best_after=self.config.save_best_after,
+                keep_all_best=self.config.save_all_best
+            )
+            self.checkpoint_manager = CheckpointManager(
+                output_path=self.output_path,
+                config=checkpoint_config,
+                save_func=self.dashboard_logger.save_model if hasattr(self.dashboard_logger, 'save_model') else None
+            )
+
         self.log_model_step = (
             self.config.log_model_step if self.config.log_model_step is not None else self.config.save_step
         )
@@ -291,7 +330,21 @@ class Trainer(Base, DataLoading, FitFunctions, Testing, EvalFunctions, StaticMet
                 self.config.distributed_url,
             )
 
-        if self.use_cuda:
+        # Device setup - CUDA or TPU
+        if self.config.use_tpu and TPU_AVAILABLE:
+            # Move model to TPU
+            self.device = get_tpu_device()
+            self.model = self.model.to(self.device)
+            if isinstance(self.criterion, list):
+                for criterion in self.criterion:
+                    if isinstance(criterion, nn.Module):
+                        criterion.to(self.device)
+            elif isinstance(self.criterion, nn.Module):
+                self.criterion.to(self.device)
+            rank_zero_logger_info(f" > Model moved to TPU device: {self.device}", logger)
+            
+        elif self.use_cuda:
+            self.device = torch.device("cuda")
             self.model.cuda()
             if isinstance(self.criterion, list):
                 for criterion in self.criterion:
@@ -299,6 +352,9 @@ class Trainer(Base, DataLoading, FitFunctions, Testing, EvalFunctions, StaticMet
                         criterion.cuda()
             elif isinstance(self.criterion, nn.Module):
                 self.criterion.cuda()
+        else:
+            self.device = torch.device("cpu")
+            rank_zero_logger_info(" > Using CPU for training", logger)
 
         # setup optimizer
         self.optimizer = self.get_optimizer(self.model, self.config)
@@ -323,11 +379,70 @@ class Trainer(Base, DataLoading, FitFunctions, Testing, EvalFunctions, StaticMet
             self.scheduler, self.args, self.config, self.restore_epoch, self.restore_step
         )
 
+        # setup SWA manager
+        if swa_config is not None:
+            self.swa_manager = SWAManager(
+                model=self.model,
+                config=swa_config,
+                optimizer=self.optimizer,
+                output_path=self.output_path
+            )
+        else:
+            self.swa_manager = None
+
+        # setup Deepspeed manager
+        if deepspeed_config is not None:
+            self.deepspeed_manager = DeepspeedManager(
+                config=deepspeed_config,
+                model=self.model,
+                optimizer=self.optimizer,
+                trainer_config=self.config,
+                output_path=self.output_path
+            )
+        elif self.config.use_deepspeed:
+            # Create default Deepspeed config from trainer config
+            auto_deepspeed_config = create_deepspeed_config(
+                zero_stage=self.config.deepspeed_zero_stage,
+                enable_mixed_precision=self.config.mixed_precision,
+                enable_cpu_offload=self.config.deepspeed_cpu_offload,
+                config_file=self.config.deepspeed_config_file,
+            )
+            self.deepspeed_manager = DeepspeedManager(
+                config=auto_deepspeed_config,
+                model=self.model,
+                optimizer=self.optimizer,
+                trainer_config=self.config,
+                output_path=self.output_path
+            )
+        else:
+            self.deepspeed_manager = None
+
         # DISTRIBUTED
         self.wrapped_model: TrainerModel | None = None
-        if self.use_pt_ddp:
+        
+        # Initialize Deepspeed engine if configured
+        if self.deepspeed_manager and self.deepspeed_manager.should_use_deepspeed():
+            if self.use_pt_ddp or self.use_accelerate:
+                logger.warning(" > Deepspeed is enabled. Disabling DDP and Accelerate for compatibility.")
+                self.args.use_ddp = False
+                # Note: we don't override use_accelerate property as it might be needed for other checks
+            
+            logger.info(" > Initializing Deepspeed engine...")
+            engine = self.deepspeed_manager.initialize_engine(
+                model=self.model,
+                optimizer=self.optimizer,
+                lr_scheduler=self.scheduler,
+                training_data=None  # Will be set later when data loader is available
+            )
+            
+            # Update model and optimizer references to use Deepspeed
+            self.model = self.deepspeed_manager.get_model()
+            self.optimizer = self.deepspeed_manager.get_optimizer()
+            self.wrapped_model = engine  # Use Deepspeed engine as wrapped model
+            
+        elif self.use_pt_ddp:
             ddp_model = DDP_th(self.model, device_ids=[args.rank], output_device=args.rank)
-            self.wrapped_model = ddp_model.module  # cast(TrainerModel, ddp_model.module)
+            self.wrapped_model = ddp_model  # Keep the DDP wrapper for training
 
         # setup accelerator
         self.setup_accelerate()
@@ -529,6 +644,9 @@ class Trainer(Base, DataLoading, FitFunctions, Testing, EvalFunctions, StaticMet
                 ctx_mgr = self.accelerator.autocast if self.config.mixed_precision else nullcontext
                 with ctx_mgr():
                     self.accelerator.backward(loss_dict["loss"])
+                    # TPU synchronization after backward pass
+                    if self.config.use_tpu and TPU_AVAILABLE and step_optimizer:
+                        mark_step()
                     grad_norm = self._compute_grad_norm(optimizer)
                     if self.accelerator.sync_gradients and grad_clip is not None and grad_clip > 0:
                         self.accelerator.clip_grad_norm_(self.model.parameters(), grad_clip)
@@ -540,10 +658,50 @@ class Trainer(Base, DataLoading, FitFunctions, Testing, EvalFunctions, StaticMet
                     ):
                         scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
+                    # TPU synchronization after optimizer step
+                    if self.config.use_tpu and TPU_AVAILABLE and step_optimizer:
+                        mark_step()
+        elif self.use_deepspeed:
+            # Deepspeed training path
+            if self.deepspeed_manager and self.deepspeed_manager.is_initialized:
+                # Backward pass through Deepspeed
+                self.deepspeed_manager.backward(loss_dict["loss"])
+                
+                if step_optimizer and self.deepspeed_manager.is_gradient_accumulation_boundary():
+                    # Gradient clipping is handled internally by Deepspeed if configured
+                    grad_norm = 0.0  # Deepspeed doesn't expose grad norm easily
+                    
+                    # Step optimizer through Deepspeed
+                    self.deepspeed_manager.step()
+                    
+                    # Step scheduler if configured and not after epoch
+                    if (
+                        scheduler is not None
+                        and not self.config.scheduler_after_epoch
+                    ):
+                        scheduler.step()
+                else:
+                    grad_norm = 0.0
+            else:
+                logger.warning(" > Deepspeed manager not initialized properly, falling back to standard training")
+                # Fallback to standard training
+                loss_dict["loss"].backward()
+                if step_optimizer:
+                    if grad_clip > 0:
+                        grad_norm = self._grad_clipping(grad_clip=grad_clip, optimizer=optimizer, scaler=None)
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+                    if scheduler is not None and not self.config.scheduler_after_epoch:
+                        scheduler.step()
+                else:
+                    grad_norm = 0.0
         else:
             if self.use_amp_scaler and scaler is not None:
                 # Improved mixed precision training
                 scaler.scale(loss_dict["loss"]).backward()
+                # TPU synchronization after backward pass
+                if self.config.use_tpu and TPU_AVAILABLE and step_optimizer:
+                    mark_step()
                 if step_optimizer:
                     grad_norm = self._grad_clipping(grad_clip=grad_clip, optimizer=optimizer, scaler=scaler)
                     scale_prev = scaler.get_scale()
@@ -561,8 +719,14 @@ class Trainer(Base, DataLoading, FitFunctions, Testing, EvalFunctions, StaticMet
                         and not self.config.scheduler_after_epoch
                     ):
                         scheduler.step()
+                    # TPU synchronization after optimizer step
+                    if self.config.use_tpu and TPU_AVAILABLE:
+                        mark_step()
             else:
                 loss_dict["loss"].backward()
+                # TPU synchronization after backward pass
+                if self.config.use_tpu and TPU_AVAILABLE and step_optimizer:
+                    mark_step()
                 if step_optimizer:
                     self.callbacks.before_gradient_clipping(self)
                     if grad_clip > 0:
@@ -575,6 +739,9 @@ class Trainer(Base, DataLoading, FitFunctions, Testing, EvalFunctions, StaticMet
                         and not self.config.scheduler_after_epoch
                     ):
                         scheduler.step()
+                    # TPU synchronization after optimizer step
+                    if self.config.use_tpu and TPU_AVAILABLE:
+                        mark_step()
 
             if step_optimizer:
                 optimizer.zero_grad(set_to_none=True)
@@ -766,20 +933,48 @@ class Trainer(Base, DataLoading, FitFunctions, Testing, EvalFunctions, StaticMet
 
         self.c_logger.print_train_start()
         loader_start_time = time.time()
-        # TRAINING EPOCH -> iterate over the training samples
-        batch_num_steps = len(self.train_loader)
-        for cur_step, batch in enumerate(self.train_loader):
-            outputs, _ = self.train_step(batch, batch_num_steps, cur_step, loader_start_time)
-            if outputs is None:
-                logger.info(" [!] `train_step()` retuned `None` outputs. Skipping training step.")
-                continue
-            del outputs
-            loader_start_time = time.time()
+        
+        # OVERFIT TO SINGLE BATCH -> for debugging purposes
+        if self.overfit_batch:
+            logger.info(" > Overfitting to a single batch for debugging...")
+            try:
+                # Get the first batch and reuse it throughout the epoch
+                first_batch = next(iter(self.train_loader))
+                batch_num_steps = len(self.train_loader)  # Keep original number of steps for logging
+                
+                for cur_step in range(batch_num_steps):
+                    outputs, _ = self.train_step(first_batch, batch_num_steps, cur_step, loader_start_time)
+                    if outputs is None:
+                        logger.info(" [!] `train_step()` retuned `None` outputs. Skipping training step.")
+                        continue
+                    del outputs
+                    loader_start_time = time.time()
 
-            # RUN EVAL -> run evaluation epoch in the middle of training. Useful for big datasets.
-            if self.config.run_eval_steps is not None and (self.total_steps_done % self.config.run_eval_steps == 0):
-                self.eval_epoch()
-                self.model.train()
+                    # RUN EVAL -> run evaluation epoch in the middle of training. Useful for big datasets.
+                    if self.config.run_eval_steps is not None and (self.total_steps_done % self.config.run_eval_steps == 0):
+                        self.eval_epoch()
+                        self.model.train()
+            except StopIteration:
+                logger.error(" [!] Cannot overfit to batch: training data loader is empty")
+                return
+            except Exception as e:
+                logger.error(f" [!] Error during overfit batch training: {str(e)}")
+                raise
+        else:
+            # TRAINING EPOCH -> iterate over the training samples
+            batch_num_steps = len(self.train_loader)
+            for cur_step, batch in enumerate(self.train_loader):
+                outputs, _ = self.train_step(batch, batch_num_steps, cur_step, loader_start_time)
+                if outputs is None:
+                    logger.info(" [!] `train_step()` retuned `None` outputs. Skipping training step.")
+                    continue
+                del outputs
+                loader_start_time = time.time()
+
+                # RUN EVAL -> run evaluation epoch in the middle of training. Useful for big datasets.
+                if self.config.run_eval_steps is not None and (self.total_steps_done % self.config.run_eval_steps == 0):
+                    self.eval_epoch()
+                    self.model.train()
 
         epoch_time = time.time() - epoch_start_time
         self.callbacks.on_train_epoch_end(self)
@@ -804,5 +999,13 @@ class Trainer(Base, DataLoading, FitFunctions, Testing, EvalFunctions, StaticMet
             self.dashboard_logger.train_epoch_stats(self.total_steps_done, epoch_stats)
             if self.config.model_param_stats:
                 self.dashboard_logger.model_weights(self.model, self.total_steps_done)
-        torch.cuda.empty_cache()
+        
+        # Memory cleanup - TPU or CUDA
+        if self.config.use_tpu and TPU_AVAILABLE:
+            # TPU memory management and synchronization
+            if self.config.tpu_metrics_debug:
+                print_tpu_memory_info()
+            mark_step()  # Final synchronization for the epoch
+        else:
+            torch.cuda.empty_cache()
 

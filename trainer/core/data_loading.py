@@ -44,9 +44,14 @@ class DataLoading:
         return loader
 
     def _get_model(self) -> TrainerModel:
+        """Get the model for training (DDP wrapped if available)."""
         if not hasattr(self, "wrapped_model") or self.wrapped_model is None:
             return self.model
         return self.wrapped_model
+    
+    def _get_unwrapped_model(self) -> TrainerModel:
+        """Get the unwrapped model (without DDP wrapper)."""
+        return self.model
 
     def get_train_dataloader(
         self, training_assets: dict[str, Any], samples: list[Any] | None, *, verbose: bool

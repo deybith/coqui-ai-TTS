@@ -137,4 +137,15 @@ class EvalFunctions:
                     self.total_steps_done,
                 )
             self.dashboard_logger.eval_stats(self.total_steps_done, self.keep_avg_eval.avg_values)
-        torch.cuda.empty_cache()
+        
+        # Memory cleanup - TPU or CUDA
+        if hasattr(self.config, 'use_tpu') and self.config.use_tpu:
+            try:
+                from trainer.utils.tpu import mark_step, print_tpu_memory_info
+                if hasattr(self.config, 'tpu_metrics_debug') and self.config.tpu_metrics_debug:
+                    print_tpu_memory_info()
+                mark_step()  # Synchronize TPU operations
+            except ImportError:
+                pass  # TPU not available
+        else:
+            torch.cuda.empty_cache()

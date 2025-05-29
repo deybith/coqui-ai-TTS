@@ -170,7 +170,29 @@ class StaticMethods:
             rlimit = resource.getrlimit(resource.RLIMIT_NOFILE)
             resource.setrlimit(resource.RLIMIT_NOFILE, (4096, rlimit[1]))
 
-        # set and initialize Pytorch runtime
+        # TPU training setup
+        if config.use_tpu:
+            try:
+                from trainer.utils.tpu import is_tpu_available, setup_tpu_training_env  # pylint: disable=import-outside-toplevel
+                
+                if not is_tpu_available():
+                    raise RuntimeError("TPU training requested but torch_xla is not available. Please install torch_xla.")
+                
+                logger.info(" > Setting up TPU training environment...")
+                device, world_size = setup_tpu_training_env(training_seed=config.training_seed)
+                
+                # For TPU, return False for use_cuda and world_size as num_devices
+                use_cuda = False
+                num_devices = world_size
+                
+                logger.info(f" > TPU training enabled with {num_devices} cores")
+                print_training_env(args, config)
+                return use_cuda, num_devices
+                
+            except ImportError as e:
+                raise RuntimeError("TPU training requested but torch_xla is not installed. Please install torch_xla.") from e
+        
+        # Regular CUDA training setup
         use_cuda, num_gpus = setup_torch_training_env(
             args=args,
             cudnn_enable=config.cudnn_enable,

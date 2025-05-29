@@ -23,15 +23,20 @@ class Base:
     @property
     def use_pt_ddp(self) -> bool:
         """Return True if using PyTorch DDP."""
-        return self.num_gpus > 1 and not self.use_accelerate
+        return self.num_gpus > 1 and not self.use_accelerate and not self.use_deepspeed
 
     @property
     def use_accelerate(self) -> bool:
         """Return True if using HF Accelerate."""
-        return self.args.use_accelerate
+        return self.args.use_accelerate and not self.use_deepspeed
+
+    @property
+    def use_deepspeed(self) -> bool:
+        """Return True if using Deepspeed."""
+        return hasattr(self, 'deepspeed_manager') and self.deepspeed_manager and self.deepspeed_manager.should_use_deepspeed()
 
     def setup_accelerate(self) -> None:
-        if self.use_accelerate:
+        if self.use_accelerate and not self.use_deepspeed:
             self.model, self.optimizer, self.train_loader, self.scheduler, self.accelerator = self.init_accelerate(
                 model=self.model,
                 optimizer=self.optimizer,
@@ -100,6 +105,44 @@ class Base:
             return obj
 
         logger.info(" > Restoring from %s ...", os.path.basename(restore_path))
+        
+        # Check if this is a Deepspeed checkpoint restoration
+        if self.use_deepspeed and hasattr(self, 'deepspeed_manager') and self.deepspeed_manager is not None:
+            try:
+                # Check for Deepspeed checkpoint directory
+                restore_dir = os.path.dirname(restore_path)
+                
+                # Look for Deepspeed checkpoint directories
+                import glob
+                deepspeed_checkpoint_pattern = os.path.join(restore_dir, "deepspeed_checkpoint_*")
+                deepspeed_checkpoints = glob.glob(deepspeed_checkpoint_pattern)
+                
+                if deepspeed_checkpoints:
+                    # Use the most recent Deepspeed checkpoint
+                    latest_deepspeed_checkpoint = max(deepspeed_checkpoints, key=os.path.getmtime)
+                    logger.info(f" > Found Deepspeed checkpoint: {os.path.basename(latest_deepspeed_checkpoint)}")
+                    
+                    # Load Deepspeed checkpoint
+                    checkpoint_path, client_state = self.deepspeed_manager.load_checkpoint(
+                        load_dir=latest_deepspeed_checkpoint,
+                        load_optimizer_states=True,
+                        load_lr_scheduler_states=True
+                    )
+                    
+                    # Also load traditional checkpoint for metadata
+                    checkpoint = load_fsspec(restore_path, map_location="cpu")
+                    
+                    logger.info(" > Deepspeed checkpoint restored successfully")
+                    restore_step = checkpoint["step"] + 1
+                    restore_epoch = checkpoint["epoch"]
+                    torch.cuda.empty_cache()
+                    return model, optimizer, scaler, restore_step, restore_epoch
+                    
+            except Exception as e:
+                logger.warning(f" > Failed to load Deepspeed checkpoint: {e}")
+                logger.info(" > Falling back to standard checkpoint loading...")
+
+        # Standard checkpoint loading
         checkpoint = load_fsspec(restore_path, map_location="cpu")
 
         try:

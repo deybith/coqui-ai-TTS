@@ -1,12 +1,12 @@
-from xtts.train_model import train_model
+from trainer.xtts.train_model import train_model
 
 lang='es'
-train_csv='/home/ubuntu/projects/coqui-ai-Trainer/data/test/dataset/metadata_train.csv'
-eval_csv='/home/ubuntu/projects/coqui-ai-Trainer/data/test/dataset/metadata_eval.csv'
-num_epochs=10
+train_csv='/home/ubuntu/projects/create-av-content/models/salvador_mingo/dataset/metadata_train.csv'
+eval_csv='/home/ubuntu/projects/create-av-content/models/salvador_mingo/dataset/metadata_eval.csv'
+num_epochs=3
 batch_size=16
 grad_acumm=1
-out_path='/home/ubuntu/projects/coqui-ai-Trainer/data/test'
+out_path='/home/ubuntu/projects/create-av-content/models/salvador_mingo'
 max_audio_length=30
 
 def main():

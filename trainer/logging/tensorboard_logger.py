@@ -76,7 +76,7 @@ class TensorboardLogger(BaseDashboardLogger):
                     sample_rate=sample_rate,
                 )
             except RuntimeError:
-                traceback.print_exc()
+                logger.exception("Failed to add audio to tensorboard:")
 
     def flush(self) -> None:
         self.writer.flush()

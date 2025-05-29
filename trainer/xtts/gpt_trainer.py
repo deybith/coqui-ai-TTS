@@ -1,16 +1,25 @@
 import gc
+import logging
 import os
 
 from trainer import Trainer, TrainerArgs
 
-from xtts.shared_configs import BaseDatasetConfig
-from TTS.tts.datasets import load_tts_samples
-from TTS.tts.layers.xtts.trainer.gpt_trainer import GPTArgs, GPTTrainer, GPTTrainerConfig
-from TTS.tts.models.xtts import XttsAudioConfig
+from trainer.xtts.shared_configs import BaseDatasetConfig
+from trainer.xtts.datasets import load_tts_samples
+from trainer.xtts.layers.xtts.trainer.gpt_trainer import GPTArgs, GPTTrainer, GPTTrainerConfig
+from trainer.xtts.models.xtts import XttsAudioConfig
 from TTS.utils.manage import ModelManager
 
+logger = logging.getLogger("trainer")
 
-def train_gpt(language, num_epochs, batch_size, grad_acumm, train_csv, eval_csv, output_path, max_audio_length=255995, training_seed=54321):
+
+def train_gpt(language, num_epochs, batch_size, grad_acumm, train_csv, eval_csv, output_path, max_audio_length=255995, training_seed=54321, config=None):
+    """
+    Enhanced GPT training function with support for optimized configurations.
+    
+    Args:
+        config: Optional EnhancedXTTSConfig object with optimized parameters
+    """
     #  Logging parameters
     RUN_NAME = "GPT_XTTS_FT"
     PROJECT_NAME = "XTTS_trainer"
@@ -53,7 +62,7 @@ def train_gpt(language, num_epochs, batch_size, grad_acumm, train_csv, eval_csv,
 
     # download DVAE files if needed
     if not os.path.isfile(DVAE_CHECKPOINT) or not os.path.isfile(MEL_NORM_FILE):
-        print(" > Downloading DVAE files!")
+        logger.info(" > Downloading DVAE files!")
         ModelManager._download_model_files(
             [MEL_NORM_LINK, DVAE_CHECKPOINT_LINK], CHECKPOINTS_OUT_PATH, progress_bar=True
         )
@@ -70,30 +79,85 @@ def train_gpt(language, num_epochs, batch_size, grad_acumm, train_csv, eval_csv,
 
     # download XTTS v2.0 files if needed
     if not os.path.isfile(TOKENIZER_FILE) or not os.path.isfile(XTTS_CHECKPOINT):
-        print(" > Downloading XTTS v2.0 files!")
+        logger.info(" > Downloading XTTS v2.0 files!")
         ModelManager._download_model_files(
             [TOKENIZER_FILE_LINK, XTTS_CHECKPOINT_LINK, XTTS_CONFIG_LINK], CHECKPOINTS_OUT_PATH, progress_bar=True
         )
 
-    # init args and config
-    model_args = GPTArgs(
-        max_conditioning_length=132300,  # 6 secs
-        min_conditioning_length=66150,  # 3 secs
-        debug_loading_failures=False,
-        max_wav_length=max_audio_length,  # ~11.6 seconds
-        max_text_length=200,
-        mel_norm_file=MEL_NORM_FILE,
-        dvae_checkpoint=DVAE_CHECKPOINT,
-        xtts_checkpoint=XTTS_CHECKPOINT,  # checkpoint path of the model that you want to fine-tune
-        tokenizer_file=TOKENIZER_FILE,
-        gpt_num_audio_tokens=1026,
-        gpt_start_audio_token=1024,
-        gpt_stop_audio_token=1025,
-        gpt_use_masking_gt_prompt_approach=True,
-        gpt_use_perceiver_resampler=True,
-    )
-    # define audio config
-    audio_config = XttsAudioConfig(sample_rate=22050, dvae_sample_rate=22050, output_sample_rate=24000)
+    # init args and config - use enhanced config if provided
+    if config and hasattr(config, 'gpt'):
+        # Use enhanced GPT configuration
+        enhanced_gpt = config.gpt
+        logger.info("🚀 Using enhanced GPT configuration")
+        
+        model_args = GPTArgs(
+            max_conditioning_length=enhanced_gpt.max_conditioning_length,
+            min_conditioning_length=enhanced_gpt.min_conditioning_length,
+            debug_loading_failures=False,
+            max_wav_length=enhanced_gpt.max_wav_length,
+            max_text_length=enhanced_gpt.max_text_length,
+            mel_norm_file=MEL_NORM_FILE,
+            dvae_checkpoint=DVAE_CHECKPOINT,
+            xtts_checkpoint=XTTS_CHECKPOINT,
+            tokenizer_file=TOKENIZER_FILE,
+            gpt_num_audio_tokens=enhanced_gpt.gpt_num_audio_tokens,
+            gpt_start_audio_token=enhanced_gpt.gpt_start_audio_token,
+            gpt_stop_audio_token=enhanced_gpt.gpt_stop_audio_token,
+            gpt_use_masking_gt_prompt_approach=enhanced_gpt.gpt_use_masking_gt_prompt_approach,
+            gpt_use_perceiver_resampler=enhanced_gpt.gpt_use_perceiver_resampler,
+            gpt_max_audio_tokens=enhanced_gpt.gpt_max_audio_tokens,
+            gpt_max_text_tokens=enhanced_gpt.gpt_max_text_tokens,
+            temperature=enhanced_gpt.temperature,
+            repetition_penalty=enhanced_gpt.repetition_penalty,
+            top_k=enhanced_gpt.top_k,
+            top_p=enhanced_gpt.top_p,
+        )
+        
+        # Use enhanced audio config if available
+        if hasattr(config, 'audio'):
+            enhanced_audio = config.audio
+            logger.info("🎵 Using enhanced audio configuration")
+            audio_config = XttsAudioConfig(
+                sample_rate=enhanced_audio.sample_rate,
+                dvae_sample_rate=enhanced_audio.sample_rate,
+                output_sample_rate=enhanced_audio.output_sample_rate,
+                hop_length=enhanced_audio.hop_length,
+                win_length=enhanced_audio.win_length,
+                fft_size=enhanced_audio.fft_size,
+                mel_fmin=enhanced_audio.mel_fmin,
+                mel_fmax=enhanced_audio.mel_fmax,
+                num_mels=enhanced_audio.num_mels,
+                do_sound_norm=enhanced_audio.do_sound_norm,
+                do_rms_norm=enhanced_audio.do_rms_norm,
+                do_dynamic_range_compression=enhanced_audio.do_dynamic_range_compression,
+                trim_db=enhanced_audio.trim_db,
+                power=enhanced_audio.power,
+                griffin_lim_iters=enhanced_audio.griffin_lim_iters,
+            )
+        else:
+            audio_config = XttsAudioConfig(sample_rate=22050, dvae_sample_rate=22050, output_sample_rate=24000)
+            
+    else:
+        # Use original configuration
+        logger.info("📝 Using original GPT configuration")
+        model_args = GPTArgs(
+            max_conditioning_length=132300,  # 6 secs
+            min_conditioning_length=66150,  # 3 secs
+            debug_loading_failures=False,
+            max_wav_length=max_audio_length,  # ~11.6 seconds
+            max_text_length=200,
+            mel_norm_file=MEL_NORM_FILE,
+            dvae_checkpoint=DVAE_CHECKPOINT,
+            xtts_checkpoint=XTTS_CHECKPOINT,  # checkpoint path of the model that you want to fine-tune
+            tokenizer_file=TOKENIZER_FILE,
+            gpt_num_audio_tokens=1026,
+            gpt_start_audio_token=1024,
+            gpt_stop_audio_token=1025,
+            gpt_use_masking_gt_prompt_approach=True,
+            gpt_use_perceiver_resampler=True,
+        )
+        # define audio config
+        audio_config = XttsAudioConfig(sample_rate=22050, dvae_sample_rate=22050, output_sample_rate=24000)
     # training parameters config
     config = GPTTrainerConfig(
         epochs=num_epochs,

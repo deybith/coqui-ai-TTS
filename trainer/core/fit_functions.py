@@ -4,7 +4,7 @@ import os
 import sys
 import traceback
 from contextlib import suppress
-from typing import Any
+from typing import Any, Optional, TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
@@ -22,6 +22,9 @@ from trainer.utils.cuda_memory import cuda_meminfo, should_reduce_batch_size
 from trainer.utils.distributed import (
     rank_zero_only,
 )
+
+if TYPE_CHECKING:
+    from trainer.batch_size_scaler import BatchSizeConfig, BatchSizeResult
 
 logger = logging.getLogger("trainer")
 
@@ -46,12 +49,35 @@ class FitFunctions:
             self.keep_avg_eval = KeepAverage() if self.config.run_eval else None
             self.epochs_done = epoch
             self.c_logger.print_epoch_start(epoch, self.config.epochs, self.output_path)
+            
+            # SWA: Check if we should start SWA at this epoch
+            if hasattr(self, 'swa_manager') and self.swa_manager is not None:
+                if self.swa_manager.should_start_swa(epoch):
+                    self.swa_manager.start_swa(epoch)
+            
             if not self.skip_train_epoch and not self.start_with_eval:
                 self.train_epoch()
             if self.config.run_eval:
                 self.eval_epoch()
             if epoch >= self.config.test_delay_epochs and self.args.rank <= 0:
                 self.test_run()
+
+            # SWA: Update SWA model and scheduler if active
+            if hasattr(self, 'swa_manager') and self.swa_manager is not None:
+                if self.swa_manager.should_update_swa(epoch):
+                    self.swa_manager.update_swa_model(epoch)
+                if self.swa_manager.is_active:
+                    self.swa_manager.step_swa_scheduler()
+                    # Save SWA model checkpoint if configured
+                    if self.swa_manager.config.save_swa_model and epoch % self.config.save_step == 0:
+                        eval_loss = self._pick_target_avg_loss(self.keep_avg_eval)
+                        train_loss = self._pick_target_avg_loss(self.keep_avg_train) or float("inf")
+                        current_loss = eval_loss if eval_loss is not None else train_loss
+                        self.swa_manager.save_swa_model(
+                            current_epoch=epoch,
+                            current_step=self.total_steps_done,
+                            current_loss=current_loss
+                        )
 
             self.c_logger.print_epoch_end(
                 epoch,
@@ -61,9 +87,19 @@ class FitFunctions:
                 self.save_best_model()
             self.callbacks.on_epoch_end(self)
             self.start_with_eval = False
+        
+        # SWA: Finalize SWA after training completion
+        if hasattr(self, 'swa_manager') and self.swa_manager is not None and self.swa_manager.is_active:
+            logger.info("🏁 Training completed, finalizing SWA...")
+            # Use train_loader for final batch normalization statistics update
+            train_loader = getattr(self, 'train_loader', None)
+            self.swa_manager.finalize_swa(dataloader=train_loader)
 
     def fit_with_largest_batch_size(self, starting_batch_size: int = 2048) -> None:
         """Find and use the largest possible batch size for training.
+        
+        This method uses a simple halving strategy for backward compatibility.
+        For more advanced batch size optimization, use fit_with_auto_batch_size().
         
         Args:
             starting_batch_size (int): Initial batch size to try. Defaults to 2048.
@@ -89,6 +125,33 @@ class FitFunctions:
                     clear_memory()
                 else:
                     raise
+
+    def fit_with_auto_batch_size(self, batch_size_config: Optional["BatchSizeConfig"] = None) -> "BatchSizeResult":
+        """Find and use the optimal batch size with advanced scaling strategies.
+        
+        This method provides sophisticated batch size optimization with multiple strategies,
+        safety features, and detailed reporting.
+        
+        Args:
+            batch_size_config: Configuration for batch size scaling. Uses defaults if None.
+            
+        Returns:
+            BatchSizeResult with optimization details and final batch size used.
+        """
+        from trainer.batch_size_scaler import BatchSizeScaler, BatchSizeConfig
+        
+        if batch_size_config is None:
+            batch_size_config = BatchSizeConfig()
+        
+        scaler = BatchSizeScaler(batch_size_config)
+        result = scaler.find_optimal_batch_size(self)
+        
+        # Set the optimal batch size and train
+        logger.info("🚀 Starting training with optimal batch size: %d", result.optimal_batch_size)
+        self.config.batch_size = result.optimal_batch_size
+        self._fit()
+        
+        return result
 
     def fit(self) -> None:
         """Start the training process.
@@ -116,12 +179,12 @@ class FitFunctions:
         except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
             logger.error(" > Training error: %s", str(e))
             remove_experiment_folder(self.output_path)
-            traceback.print_exc()
+            logger.exception("Exception occurred during training:")
             sys.exit(1)
         except Exception as e:  # pylint: disable=broad-except
             logger.error(" > Unexpected error: %s", str(e))
             remove_experiment_folder(self.output_path)
-            traceback.print_exc()
+            logger.exception("Unexpected exception occurred:")
             sys.exit(1)
             
     def _handle_interrupt(self) -> None:
@@ -230,21 +293,97 @@ class FitFunctions:
         eval_loss = self._pick_target_avg_loss(self.keep_avg_eval)
         train_loss = self._pick_target_avg_loss(self.keep_avg_train) or float("inf")
 
-        # save the model and update the best_loss
-        self.best_loss = save_best_model(
-            {"train_loss": train_loss, "eval_loss": eval_loss},
-            self.best_loss,
-            self.config,
-            self._get_model(),
-            self.optimizer,
-            self.scaler if self.use_amp_scaler else None,
-            self.total_steps_done,
-            self.epochs_done,
-            self.output_path,
-            keep_all_best=self.config.save_all_best,
-            keep_after=self.config.save_best_after,
-            save_func=self.dashboard_logger.save_model,
-        )
+        # Check if this is a better model
+        current_loss = {"train_loss": train_loss, "eval_loss": eval_loss}
+        
+        # Determine if we should save based on target loss
+        if eval_loss is not None and self.best_loss.get("eval_loss") is not None:
+            is_better = eval_loss < self.best_loss["eval_loss"]
+        else:
+            is_better = train_loss < self.best_loss["train_loss"]
+        
+        if not is_better or self.total_steps_done <= self.config.save_best_after:
+            return
+
+        # Handle Deepspeed checkpoint saving
+        if self.use_deepspeed and hasattr(self, 'deepspeed_manager') and self.deepspeed_manager is not None:
+            try:
+                # Save Deepspeed checkpoint
+                deepspeed_checkpoint_dir = self.deepspeed_manager.save_checkpoint(
+                    save_dir=self.output_path,
+                    tag=f"best_model_{self.total_steps_done}"
+                )
+                
+                # Also save a traditional checkpoint for compatibility
+                best_model_name = f"best_model_{self.total_steps_done}.pth"
+                checkpoint_path = os.path.join(self.output_path, best_model_name)
+                
+                from trainer.io import save_model
+                save_model(
+                    self.config,
+                    self._get_model(),
+                    self.optimizer,
+                    self.scaler if self.use_amp_scaler else None,
+                    self.total_steps_done,
+                    self.epochs_done,
+                    checkpoint_path,
+                    model_loss=current_loss,
+                    deepspeed_checkpoint_dir=deepspeed_checkpoint_dir,
+                    save_func=self.dashboard_logger.save_model,
+                )
+                
+                # Update best_loss tracking
+                if isinstance(self.best_loss, dict):
+                    self.best_loss["train_loss"] = train_loss
+                    if eval_loss is not None:
+                        self.best_loss["eval_loss"] = eval_loss
+                else:
+                    self.best_loss = eval_loss if eval_loss is not None else train_loss
+                    
+                logger.info(f" > BEST DEEPSPEED MODEL saved at step {self.total_steps_done}")
+                return
+                
+            except Exception as e:
+                logger.warning(f" > Failed to save Deepspeed best model checkpoint: {e}")
+                # Fall through to standard checkpoint saving
+
+        # Use CheckpointManager for enhanced checkpoint management
+        if hasattr(self, 'checkpoint_manager') and self.checkpoint_manager is not None:
+            was_saved = self.checkpoint_manager.save_best_model(
+                current_loss=current_loss,
+                model=self._get_model(),
+                optimizer=self.optimizer,
+                step=self.total_steps_done,
+                epoch=self.epochs_done,
+                config=self.config,
+                scaler=self.scaler if self.use_amp_scaler else None,
+            )
+            if was_saved:
+                # Update best_loss tracking for backward compatibility
+                target_loss = eval_loss if eval_loss is not None else train_loss
+                if isinstance(self.best_loss, dict):
+                    self.best_loss["train_loss"] = train_loss
+                    if eval_loss is not None:
+                        self.best_loss["eval_loss"] = eval_loss
+                else:
+                    self.best_loss = target_loss
+        else:
+            # Fallback to original implementation
+            from trainer.io import save_best_model
+            self.best_loss = save_best_model(
+                {"train_loss": train_loss, "eval_loss": eval_loss},
+                self.best_loss,
+                self.config,
+                self._get_model(),
+                self.optimizer,
+                self.scaler if self.use_amp_scaler else None,
+                self.total_steps_done,
+                self.epochs_done,
+                self.output_path,
+                keep_all_best=self.config.save_all_best,
+                keep_after=self.config.save_best_after,
+                save_func=self.dashboard_logger.save_model,
+            )
 
     @rank_zero_only
     def save_checkpoint(self) -> None:
@@ -252,18 +391,73 @@ class FitFunctions:
         eval_loss = self._pick_target_avg_loss(self.keep_avg_eval)
         train_loss = self._pick_target_avg_loss(self.keep_avg_train)
 
-        save_checkpoint(
-            self.config,
-            self._get_model(),
-            self.optimizer,
-            self.scaler if self.use_amp_scaler else None,
-            self.total_steps_done,
-            self.epochs_done,
-            self.output_path,
-            model_loss={"train_loss": train_loss, "eval_loss": eval_loss},
-            save_n_checkpoints=self.config.save_n_checkpoints,
-            save_func=self.dashboard_logger.save_model,
-        )
+        # Handle Deepspeed checkpoint saving
+        if self.use_deepspeed and hasattr(self, 'deepspeed_manager') and self.deepspeed_manager is not None:
+            try:
+                # Save Deepspeed checkpoint
+                deepspeed_checkpoint_dir = self.deepspeed_manager.save_checkpoint(
+                    save_dir=self.output_path,
+                    tag=f"checkpoint_{self.total_steps_done}"
+                )
+                
+                # Also save a traditional checkpoint for compatibility
+                checkpoint_name = f"checkpoint_{self.total_steps_done}.pth"
+                checkpoint_path = os.path.join(self.output_path, checkpoint_name)
+                
+                from trainer.io import save_model
+                save_model(
+                    self.config,
+                    self._get_model(),
+                    self.optimizer,
+                    self.scaler if self.use_amp_scaler else None,
+                    self.total_steps_done,
+                    self.epochs_done,
+                    checkpoint_path,
+                    model_loss={"train_loss": train_loss, "eval_loss": eval_loss},
+                    deepspeed_checkpoint_dir=deepspeed_checkpoint_dir,
+                    save_func=self.dashboard_logger.save_model,
+                )
+                
+                # Clean up old Deepspeed checkpoints
+                if self.config.save_n_checkpoints > 0:
+                    self._cleanup_deepspeed_checkpoints()
+                    
+                logger.info(f" > DEEPSPEED CHECKPOINT saved at step {self.total_steps_done}")
+                return
+                
+            except Exception as e:
+                logger.warning(f" > Failed to save Deepspeed checkpoint: {e}")
+                # Fall through to standard checkpoint saving
+
+        # Use CheckpointManager for enhanced checkpoint management
+        if hasattr(self, 'checkpoint_manager') and self.checkpoint_manager is not None:
+            self.checkpoint_manager.save_checkpoint(
+                model=self._get_model(),
+                optimizer=self.optimizer,
+                step=self.total_steps_done,
+                epoch=self.epochs_done,
+                config=self.config,
+                scaler=self.scaler if self.use_amp_scaler else None,
+                train_loss=train_loss,
+                eval_loss=eval_loss,
+            )
+            # Automatic cleanup of old checkpoints
+            self.checkpoint_manager.cleanup_old_checkpoints()
+        else:
+            # Fallback to original implementation
+            from trainer.io import save_checkpoint
+            save_checkpoint(
+                self.config,
+                self._get_model(),
+                self.optimizer,
+                self.scaler if self.use_amp_scaler else None,
+                self.total_steps_done,
+                self.epochs_done,
+                self.output_path,
+                model_loss={"train_loss": train_loss, "eval_loss": eval_loss},
+                save_n_checkpoints=self.config.save_n_checkpoints,
+                save_func=self.dashboard_logger.save_model,
+            )
 
     @rank_zero_only
     def update_training_dashboard_logger(
@@ -288,3 +482,30 @@ class FitFunctions:
                     self.training_assets,
                     self.total_steps_done,
                 )
+
+    def _cleanup_deepspeed_checkpoints(self) -> None:
+        """Clean up old Deepspeed checkpoint directories."""
+        try:
+            import glob
+            import shutil
+            
+            # Find all Deepspeed checkpoint directories
+            checkpoint_pattern = os.path.join(self.output_path, "deepspeed_checkpoint_checkpoint_*")
+            checkpoint_dirs = glob.glob(checkpoint_pattern)
+            
+            if len(checkpoint_dirs) <= self.config.save_n_checkpoints:
+                return
+            
+            # Sort by modification time and keep only the most recent
+            checkpoint_dirs.sort(key=os.path.getmtime)
+            dirs_to_remove = checkpoint_dirs[:-self.config.save_n_checkpoints]
+            
+            for dir_path in dirs_to_remove:
+                try:
+                    shutil.rmtree(dir_path)
+                    logger.info(f" > Removed old Deepspeed checkpoint: {os.path.basename(dir_path)}")
+                except Exception as e:
+                    logger.warning(f" > Failed to remove old Deepspeed checkpoint {dir_path}: {e}")
+                    
+        except Exception as e:
+            logger.warning(f" > Failed to cleanup old Deepspeed checkpoints: {e}")
